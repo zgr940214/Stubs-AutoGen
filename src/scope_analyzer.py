@@ -1,192 +1,197 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence
+
 from pycparser import parse_file, c_ast
-from collections import deque
+
 import sys
 
-class Notifier:
-    def __init__(self):
-        self._signatures: dict[str, str] = {}
-        self._pending: set[str] = set()
+# ──────────────────────────────── 1  Data models ────────────────────────────────
+Callback = Callable[[str], None]           # cb(new_ret_type)
 
-    def add_signature(self, name: str, ret_type: str) -> None:
-        self._signatures[name] = ret_type
-        self._pending.discard()
+@dataclass
+class StubInfo:
+    """Metadata for a function that may need a stub."""
+    is_stub: bool
+    ret_type: str                # may start as "void*"
+    param_types: List[str] = field(default_factory=list)
+    _cbs: List[Callback] = field(default_factory=list, repr=False)
+
+    # register / fire
+    def add_cb(self, cb: Callback) -> None:       self._cbs.append(cb)
+    def fire(self, real: str) -> None:
+        self.ret_type = real
+        for cb in self._cbs: cb(real)
+        self._cbs.clear()
+
+
+@dataclass
+class ScopeFrame:
+    symbols: Dict[str, str] = field(default_factory=dict)
+    is_func: bool = False
+    ret_type: Optional[str] = None
+
 
 class ScopeStack:
-    def __init__(self):
-        self.stack = deque([{}])  # initialize with empty global scope
+    def __init__(self) -> None:
+        self._stack: List[ScopeFrame] = [ScopeFrame()]           # global
 
-    def push_scope(self):
-        self.stack.append({})
+    # helpers -------------------------------------------------------------------
+    def push_block(self) -> None:                       self._stack.append(ScopeFrame())
+    def push_func(self, ret: str) -> None:              self._stack.append(ScopeFrame(is_func=True, ret_type=ret))
+    def pop(self) -> None:                              self._stack.pop()
 
-    def pop_scope(self):
-        self.stack.pop()
+    def add_var(self, name: str, typ: str) -> None:     self._stack[-1].symbols[name] = typ
+    def find_var(self, name: str) -> Optional[str]:
+        for frame in reversed(self._stack):
+            if name in frame.symbols: return frame.symbols[name]
+        return None
 
-    def add_variable(self, name, typename):
-        self.stack[-1][name] = typename
+    def enclosing_ret(self) -> Optional[str]:
+        for frame in reversed(self._stack):
+            if frame.is_func: return frame.ret_type
+        return None
 
-    def find_type(self, name):
-        for scope in reversed(self.stack):
-            if name in scope:
-                return scope[name]
-        return "void"  # fallback
 
-class ScopedVisitor(c_ast.NodeVisitor):
-    def __init__(self, scope_stack, stub_list_file):
-        self.scope_stack = scope_stack
-        path = Path(stub_list_file)
-        self.stub_nl = path.read_text(encoding="utf-8").splitlines()
-        self.stub_output_list = []
+# ───────────────────────────── 2  Expression inference ──────────────────────────
+def infer_expr_type(expr: c_ast.Node,
+                    scope: ScopeStack,
+                    stubs: Dict[str, StubInfo]) -> str:
+    """Very small subset: ID / address-of / nested FuncCall. Expand as needed."""
+    if isinstance(expr, c_ast.ID):
+        return scope.find_var(expr.name) or "void*"
 
-    def visit_Decl(self, node):
+    if isinstance(expr, c_ast.UnaryOp) and expr.op == "&":
+        base = infer_expr_type(expr.expr, scope, stubs)
+        return f"{base} *"
+
+    if isinstance(expr, c_ast.FuncCall) and isinstance(expr.name, c_ast.ID):
+        fname = expr.name.name
+        info = stubs.get(fname)
+        if info: return info.ret_type
+        # unknown → register placeholder
+        stubs[fname] = StubInfo(is_stub=True, ret_type="void*", param_types=[])
+        return "void*"
+
+    return "int"          # fallback
+
+
+# ─────────────────────────── 3  Main visitor (single TU) ─────────────────────────
+class TUVisitor(c_ast.NodeVisitor):
+    def __init__(self, stub_whitelist: Sequence[str]) -> None:
+        self.scope = ScopeStack()
+        self.stubs: Dict[str, StubInfo] = {}
+        self.interesting = set(stub_whitelist)
+
+    # --- declarations (vars / params) -----------------------------------------
+    def visit_Decl(self, node: c_ast.Decl):
         if isinstance(node.type, c_ast.TypeDecl):
-            typename = " ".join(node.type.type.names)  # e.g. "int", "unsigned int"
-            self.scope_stack.add_variable(node.name, typename)
+            typ = " ".join(node.type.type.names)
+            self.scope.add_var(node.name, typ)
         elif isinstance(node.type, c_ast.PtrDecl) and isinstance(node.type.type, c_ast.TypeDecl):
-            typename = " ".join(node.type.type.type.names) + " *"
-            self.scope_stack.add_variable(node.name, typename)
-
-    def visit_Compound(self, node):
-        self.scope_stack.push_scope()
-        for stmt in node.block_items or []:
-            self.visit(stmt)
-        self.scope_stack.pop_scope()
-
-    def visit_Return(self, node: c_ast.Return):
-        """
-                If return <expr>; where <expr> is a FuncCall with no type,
-                assign the surrounding function's return type as best guess.
-                """
-        if isinstance(node.expr, c_ast.FuncCall) and isinstance(node.expr.name, c_ast.ID):
-            callee = node.expr.name.name
-            # 1) already known? nothing to do
-            if self.cbreg.resolve(callee):
-                return
-            # 2) fall back to surrounding function's type (heuristic)
-            if self._cur_func_ret:
-                self.cbreg.deliver(callee, self._cur_func_ret)  # publish immediately
-                # Optional: mark it as 'inferred' vs 'declared'
+            typ = " ".join(node.type.type.type.names) + " *"
+            self.scope.add_var(node.name, typ)
         self.generic_visit(node)
 
-    def parse_expression_type(self, node):
-        return "void"
+    # --- function body --------------------------------------------------------
+    def visit_FuncDef(self, node: c_ast.FuncDef):
+        ret = " ".join(node.decl.type.type.type.names)       # rough stringify
+        self.scope.push_func(ret)
 
-    def parse_func_signature(self, node):
-        if node.name.name not in self.stub_nl:
-            return
-        ret_type = []
-        arg_names = []
-        params_type = []
+        # put parameters into scope
+        if node.decl.type.args:
+            for p in node.decl.type.args.params:
+                pname = p.name
+                ptype = " ".join(p.type.type.names) if isinstance(p.type, c_ast.TypeDecl) else "void*"
+                self.scope.add_var(pname, ptype)
+
+        self.generic_visit(node.body)
+        self.scope.pop()
+
+    # --- plain block ----------------------------------------------------------
+    def visit_Compound(self, node):          # override to manage block scope
+        self.scope.push_block()
+        for stmt in node.block_items or []:
+            self.visit(stmt)
+        self.scope.pop()
+
+    # --- function call --------------------------------------------------------
+    def visit_FuncCall(self, node: c_ast.FuncCall):
+        if not isinstance(node.name, c_ast.ID):  # func ptr etc.
+            return self.generic_visit(node)
+
+        fname = node.name.name
+        if fname not in self.interesting:       # ignore internal calls
+            return self.generic_visit(node)
+
+        # param types
+        param_types: List[str] = []
         if node.args:
-            for expr in node.args.exprs:
-                if isinstance(expr, c_ast.ID):
-                    arg_names.append(expr.name)
-                else:
-                    # imm / literal string / nested function call
-                    # for imm/string , we try to guess its type
-                    # nested function call, we would attach a callback funciton
-                    # which would be called after that function node has been parsed
-                    # and cb will write back its return value's type to our funciton signature structure
-                    arg_names.append(self.parse_expression_type(self, node))
-            for arg_name in arg_names:
-                params_type.append(self.scope_stack.find_type(arg_name))
-        else: #void arg
-            params_type.append("void")
-
-        return
-
-    def visit_FuncDef(self, node):
-        self.scope_stack.push_scope()
-        if isinstance(node.decl.type, c_ast.FuncDecl) and node.decl.type.args:
-            for param in node.decl.type.args.params:
-                if isinstance(param.type, c_ast.TypeDecl):
-                    typename = " ".join(param.type.type.names)
-                    self.scope_stack.add_variable(param.name, typename)
-                elif isinstance(param.type, c_ast.PtrDecl) and isinstance(param.type.type, c_ast.TypeDecl):
-                    typename = " ".join(param.type.type.type.names) + " *"
-                    self.scope_stack.add_variable(param.name, typename)
-        self.visit(node.body)
-        self.scope_stack.pop_scope()
-
-
-
-TEMPLATE = """\
-#include "{header}"
-{functions}
-"""
-
-FUNC_STUB_VOID = """\
-{ret} {name}({params}) {{
-    (void){dummy};
-}}
-"""
-
-FUNC_STUB_NONVOID = """\
-{ret} {name}({params}) {{
-    (void){dummy};
-    return 0;
-}}
-"""
-
-def parse_stubs(stub_list):
-    for ret, name, params in stub_list:
-        params = params.strip() or "void"
-        # 去除可变参数 '...'
-        param_list = [
-            p.strip() for p in params.split(",") if p.strip() and p.strip() != "..."
-        ]
-        dummy = ", ".join(p.split()[-1] for p in param_list if p != "void") or "0"
-        if ret.strip() == "void":
-            yield FUNC_STUB_VOID.format(ret=ret, name=name, params=params, dummy=dummy)
+            for arg in node.args.exprs:
+                param_types.append(infer_expr_type(arg, self.scope, self.stubs))
         else:
-            yield FUNC_STUB_NONVOID.format(
-                ret=ret, name=name, params=params, dummy=dummy
-            )
+            param_types.append("void")
 
-def gen_stubs(stub_list, file):
-    file.write_text()
-    stubs = list(parse_stubs(stub_list))
-    out_file.write_text(
-        TEMPLATE.format(header=header_path.name, functions="\n".join(stubs)),
-        encoding="utf-8",
-    )
-    print(f"✅ Stub 生成完毕: {out_file}")
+        # upsert
+        info = self.stubs.get(fname)
+        if info:
+            info.param_types = param_types
+        else:
+            self.stubs[fname] = StubInfo(is_stub=True, ret_type="void*", param_types=param_types)
 
-# 用于测试作用域分析是否正确
-def analyze_scopes(filename):
-    ast = parse_file(filename, use_cpp=True, cpp_path=r"C:/Users/zhoueric/Desktop/gcc-arm-none-eabi-10.3-2021.10/bin/arm-none-eabi-gcc.exe", cpp_args=['-E', r'-Iutils/fake_libc_include'])
-    scope_stack = ScopeStack()
-    visitor = ScopedVisitor(scope_stack)
-    visitor.visit(ast)
-    print("Scope stack analysis complete (no runtime errors).")
+        # continue into arguments (important for nested calls)
+        self.generic_visit(node)
 
-# 使用示例（你可以把路径换成自己的测试用C文件）
-# analyze_scopes("test.c")
-# Run logic as module
-def analyze_and_stub(filename, generate_stub, stub_name_list):
-    ast = parse_file(filename, use_cpp=True,
-                     cpp_path=r"C:/Users/zhoueric/Desktop/gcc-arm-none-eabi-10.3-2021.10/bin/arm-none-eabi-gcc.exe",
-                     cpp_args='-E -Iutils/fake_libc_include')
-
-    ScopedFuncVisitor().visit(ast)
-    call_visitor = ScopedFuncCallVisitor()
-    call_visitor.visit(ast)
-
-    return [generate_stub(fname, args, stub_name_list)
-            for fname, args in call_visitor.stubs.items()]
+    # --- return heuristic -----------------------------------------------------
+    def visit_Return(self, node: c_ast.Return):
+        if isinstance(node.expr, c_ast.FuncCall) and isinstance(node.expr.name, c_ast.ID):
+            callee = node.expr.name.name
+            if callee in self.interesting and callee not in self.stubs:
+                guessed = self.scope.enclosing_ret()
+                self.stubs[callee] = StubInfo(is_stub=True, ret_type=guessed or "void*", param_types=[])
+        self.generic_visit(node)
 
 
-if __name__ == '__main__':
-    # if len(sys.argv) != 2:
-    #     print(f'用法: python {sys.argv[0]} source.c')
-    #     sys.exit(1)
+# ─────────────────────────── 4  Emit stub C source  ────────────────────────────
+STUB_TEMPLATE = """\
+{ret} {name}({params}) {{
+    (void){dummy};
+{ret_stmt}}}
+"""
 
-    # filename = sys.argv[1]
-    # ast = analyze_and_stub(filename, use_cpp=True,
-    #                     cpp_path=r"C:/Users/zhoueric/Desktop/gcc-arm-none-eabi-10.3-2021.10/bin/arm-none-eabi-gcc.exe",
-    #                  cpp_args=['-E', r'-Iutils/fake_libc_include'])
+def emit_stubs(stubs: Dict[str, StubInfo], out_path: Path) -> None:
+    pieces = []
+    for name, info in stubs.items():
+        if not info.is_stub:                   # skip defined functions
+            continue
+        params = ", ".join(info.param_types) or "void"
+        dummy = ", ".join(f"arg{i}" for i, _ in enumerate(info.param_types)) or "0"
+        ret_stmt = "" if info.ret_type.strip() == "void" else "    return 0;"
+        pieces.append(STUB_TEMPLATE.format(ret=info.ret_type,
+                                           name=name,
+                                           params=params,
+                                           dummy=dummy,
+                                           ret_stmt=ret_stmt))
+    out_path.write_text("\n\n".join(pieces), encoding="utf-8")
+    print("Stub file written →", out_path)
 
-    # stubs = extract_stubs(ast)
 
-    # print("需要生成Stub的函数签名列表：")
-    # for func in sorted(stubs):
-    #     print(generate_stub_signature(func))
+# ───────────────────────────── 5  End-to-end driver ────────────────────────────
+def run(source: str, stub_list_file: str, cpp_path: str):
+    whitelist = Path(stub_list_file).read_text(encoding="utf-8").splitlines()
+    ast = parse_file(source,
+                     use_cpp=True,
+                     cpp_path=cpp_path,
+                     cpp_args=['-E', r'-Iutils/fake_libc_include'])
+
+    vis = TUVisitor(whitelist)
+    vis.visit(ast)
+
+    emit_stubs(vis.stubs, Path("autostubs.c"))
+
+
+if __name__ == "__main__":
+    # python stubgen.py <file.c> <stub_names.txt> <path-to-gcc>
+    src, names, gcc = sys.argv[1:]
+    run(src, names, gcc)
