@@ -32,7 +32,10 @@ def collect_files(paths: list, extensions: Set[str]) -> Set[Path]:
             files.add(p)
     return {f for f in files if f.suffix in extensions}
 
-def parse_stubs(c_files, h_files):
+def parse_stubs(c_file_paths, h_file_paths):
+    c_files = collect_files(c_file_paths)
+    h_files = collect_files(h_file_paths)
+
     all_calls, all_defs, all_decls = set(), set(), set()
     for file in c_files:
         code = file.read_text(encoding='utf-8', errors='ignore')
@@ -50,7 +53,7 @@ def parse_stubs(c_files, h_files):
         'static', 'inline', 'extern'
     }
     stubs = sorted(all_calls - all_defs - all_decls - C_KEYWORDS)
-    return stubs
+    return stubs # return list
 
 
 def main():

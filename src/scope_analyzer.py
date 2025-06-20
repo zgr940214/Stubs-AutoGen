@@ -160,25 +160,41 @@ STUB_TEMPLATE = """\
 {ret_stmt}}}
 """
 
-def emit_stubs(stubs: Dict[str, StubInfo], out_path: Path) -> None:
-    pieces = []
+STUB_DECL_TEMPLATE ="""\
+{ret} {name}({params});
+""" 
+
+def emit_stubs(stubs: Dict[str, StubInfo], output: str) -> None:
+    c_pieces = []
+    h_pieces = []
     for name, info in stubs.items():
         if not info.is_stub:                   # skip defined functions
             continue
         params = ", ".join(info.param_types) or "void"
         dummy = ", ".join(f"arg{i}" for i, _ in enumerate(info.param_types)) or "0"
         ret_stmt = "" if info.ret_type.strip() == "void" else "    return 0;"
-        pieces.append(STUB_TEMPLATE.format(ret=info.ret_type,
+        c_pieces.append(STUB_TEMPLATE.format(ret=info.ret_type,
                                            name=name,
                                            params=params,
                                            dummy=dummy,
                                            ret_stmt=ret_stmt))
-    out_path.write_text("\n\n".join(pieces), encoding="utf-8")
-    print("Stub file written →", out_path)
+
+        h_pieces.append(STUB_DECL_TEMPLATE.format(ret=info.ret_type,
+                                                name=name,
+                                                params=params))
+
+
+    out_cfile_path = Path(output + "stub.c")
+    out_hfile_path = Path(output + "stub.h")
+    out_cfile_path.write_text("\n\n".join(c_pieces), encoding="utf-8")
+    out_hfile_path.write_text("\n\n".join(h_pieces), encoding="utf-8")
+
+    print("Stub c file written →", out_cfile_path)
+    print("Stub h file written →", out_hfile_path)
 
 
 # ───────────────────────────── 5  End-to-end driver ────────────────────────────
-def run(source: str, stub_list_file: str, cpp_path: str):
+def run(source: str, stub_list_file: str, cpp_path: str, output: str):
     whitelist = Path(stub_list_file).read_text(encoding="utf-8").splitlines()
     ast = parse_file(source,
                      use_cpp=True,
@@ -188,10 +204,11 @@ def run(source: str, stub_list_file: str, cpp_path: str):
     vis = TUVisitor(whitelist)
     vis.visit(ast)
 
-    emit_stubs(vis.stubs, Path("autostubs.c"))
+    emit_stubs(vis.stubs, output)
 
 
 if __name__ == "__main__":
     # python stubgen.py <file.c> <stub_names.txt> <path-to-gcc>
     src, names, gcc = sys.argv[1:]
-    run(src, names, gcc)
+    src_base = Path(src).stem
+    run(src, names, gcc, src_base)
