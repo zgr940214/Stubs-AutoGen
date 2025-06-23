@@ -4,8 +4,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 from pycparser import parse_file, c_ast
+import pycparser.c_ast as AST
 
+import argparse
 import sys
+import os
 
 # ──────────────────────────────── 1  Data models ────────────────────────────────
 Callback = Callable[[str], None]           # cb(new_ret_type)
@@ -25,6 +28,9 @@ class StubInfo:
         for cb in self._cbs: cb(real)
         self._cbs.clear()
 
+    def post_fire(self):
+        for cb in self._cbs: cb(self.ret_type)
+        self._cbs.clear()
 
 @dataclass
 class ScopeFrame:
@@ -77,6 +83,51 @@ def infer_expr_type(expr: c_ast.Node,
     return "int"          # fallback
 
 
+def type_to_str(t) -> str:
+    """
+    Recursively convert a pycparser type node into a readable C-type string.
+    Handles PtrDecl / ArrayDecl / FuncDecl / TypeDecl wrappers.
+    """
+
+    # ---------- 基类型 ----------
+    if isinstance(t, AST.IdentifierType):      # int, uint8_t, size_t, typedef ...
+        return ' '.join(t.names)
+
+    if isinstance(t, AST.Struct):
+        return f'struct {t.name or "anon"}'
+
+    if isinstance(t, AST.Union):
+        return f'union {t.name or "anon"}'
+
+    if isinstance(t, AST.Enum):
+        return f'enum {t.name or "anon"}'
+
+    # ---------- 包装层 ----------
+    # typedef / plain declarator：继续往里拆
+    if isinstance(t, AST.TypeDecl):
+        return type_to_str(t.type)
+
+    # 指针
+    if isinstance(t, AST.PtrDecl):
+        return type_to_str(t.type) + '*'
+
+    # 数组（忽略维度表达式，只加 []）
+    if isinstance(t, AST.ArrayDecl):
+        base = type_to_str(t.type)
+        dim  = t.dim.value if t.dim else ''
+        return f'{base}[{dim}]'
+
+    # 函数指针 / 原型
+    if isinstance(t, AST.FuncDecl):
+        ret = type_to_str(t.type)
+        if t.args:                # 可能是空形参列表
+            params = ', '.join(type_to_str(p.type) for p in t.args.params)
+        else:
+            params = ''
+        return f'{ret} ({params})'
+
+    # 未覆盖的类型——兜底
+    return t.__class__.__name__
 # ─────────────────────────── 3  Main visitor (single TU) ─────────────────────────
 class TUVisitor(c_ast.NodeVisitor):
     def __init__(self, stub_whitelist: Sequence[str]) -> None:
@@ -86,24 +137,19 @@ class TUVisitor(c_ast.NodeVisitor):
 
     # --- declarations (vars / params) -----------------------------------------
     def visit_Decl(self, node: c_ast.Decl):
-        if isinstance(node.type, c_ast.TypeDecl):
-            typ = " ".join(node.type.type.names)
-            self.scope.add_var(node.name, typ)
-        elif isinstance(node.type, c_ast.PtrDecl) and isinstance(node.type.type, c_ast.TypeDecl):
-            typ = " ".join(node.type.type.type.names) + " *"
-            self.scope.add_var(node.name, typ)
+        typ = type_to_str(node.type)
+        self.scope.add_var(node.name, typ)
         self.generic_visit(node)
 
     # --- function body --------------------------------------------------------
     def visit_FuncDef(self, node: c_ast.FuncDef):
-        ret = " ".join(node.decl.type.type.type.names)       # rough stringify
+        ret = type_to_str(node.decl.type.type)       # rough stringify
         self.scope.push_func(ret)
-
         # put parameters into scope
         if node.decl.type.args:
             for p in node.decl.type.args.params:
                 pname = p.name
-                ptype = " ".join(p.type.type.names) if isinstance(p.type, c_ast.TypeDecl) else "void*"
+                ptype = type_to_str(p.type)
                 self.scope.add_var(pname, ptype)
 
         self.generic_visit(node.body)
@@ -160,55 +206,46 @@ STUB_TEMPLATE = """\
 {ret_stmt}}}
 """
 
-STUB_DECL_TEMPLATE ="""\
-{ret} {name}({params});
-""" 
-
-def emit_stubs(stubs: Dict[str, StubInfo], output: str) -> None:
-    c_pieces = []
-    h_pieces = []
+def emit_stubs(stubs: Dict[str, StubInfo], out_path: Path) -> None:
+    pieces = []
     for name, info in stubs.items():
         if not info.is_stub:                   # skip defined functions
             continue
         params = ", ".join(info.param_types) or "void"
         dummy = ", ".join(f"arg{i}" for i, _ in enumerate(info.param_types)) or "0"
         ret_stmt = "" if info.ret_type.strip() == "void" else "    return 0;"
-        c_pieces.append(STUB_TEMPLATE.format(ret=info.ret_type,
+        pieces.append(STUB_TEMPLATE.format(ret=info.ret_type,
                                            name=name,
                                            params=params,
                                            dummy=dummy,
                                            ret_stmt=ret_stmt))
-
-        h_pieces.append(STUB_DECL_TEMPLATE.format(ret=info.ret_type,
-                                                name=name,
-                                                params=params))
-
-
-    out_cfile_path = Path(output + "stub.c")
-    out_hfile_path = Path(output + "stub.h")
-    out_cfile_path.write_text("\n\n".join(c_pieces), encoding="utf-8")
-    out_hfile_path.write_text("\n\n".join(h_pieces), encoding="utf-8")
-
-    print("Stub c file written →", out_cfile_path)
-    print("Stub h file written →", out_hfile_path)
+    out_path.write_text("\n\n".join(pieces), encoding="utf-8")
+    print("Stub file written →", out_path)
 
 
 # ───────────────────────────── 5  End-to-end driver ────────────────────────────
-def run(source: str, stub_list_file: str, cpp_path: str, output: str):
+def run(source: str, stub_list_file: str, cpp_path: str):
     whitelist = Path(stub_list_file).read_text(encoding="utf-8").splitlines()
     ast = parse_file(source,
                      use_cpp=True,
                      cpp_path=cpp_path,
-                     cpp_args=['-E', r'-Iutils/fake_libc_include'])
+                     cpp_args = [
+                        '-E',                                  # 只预处理
+                        '-nostdinc',                           # 不用 GCC 自带头
+                        r'-IC:/Users/zhoueric/Desktop/tools/venv/Lib/site-packages'
+                        r'/pycparser_fake_libc',   # ← 原始字符串
+                        '-D__attribute__(x)=',
+                        '-D__extension__=',
+                        '-D__asm__(x)=',
+                    ])
 
     vis = TUVisitor(whitelist)
     vis.visit(ast)
 
-    emit_stubs(vis.stubs, output)
+    emit_stubs(vis.stubs, Path("autostubs.c"))
 
 
 if __name__ == "__main__":
     # python stubgen.py <file.c> <stub_names.txt> <path-to-gcc>
     src, names, gcc = sys.argv[1:]
-    src_base = Path(src).stem
-    run(src, names, gcc, src_base)
+    run(src, names, gcc)
